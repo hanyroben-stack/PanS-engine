@@ -1,0 +1,441 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>PanS Game Engine</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        body { background: #000; color: #eee; font-family: 'Courier New', Courier, monospace; margin: 0; padding: 0; overflow: hidden; }
+        canvas { background: #1a1a1a; image-rendering: pixelated; display: block; margin: 0 auto; transition: all 0.3s ease; }
+        .debug-active { cursor: crosshair; border: 2px solid #333; }
+        .hidden { display: none !important; }
+        
+        /* Full screen mode adjustments */
+        .fullscreen-viewport { width: 100vw; height: 100vh; display: flex; align-items: center; justify-content: center; }
+        
+        /* Cutscene Overlay */
+        #cutscene-layer {
+            position: absolute;
+            bottom: 20px;
+            left: 50%;
+            transform: translateX(-50%);
+            width: 80%;
+            background: rgba(0,0,0,0.9);
+            border: 2px solid #3b82f6;
+            padding: 20px;
+            border-radius: 8px;
+            color: white;
+            z-index: 50;
+            display: none;
+        }
+
+        /* Menu Overlay */
+        #menu-layer {
+            position: absolute;
+            inset: 0;
+            background: rgba(0,0,0,0.8);
+            display: none;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            z-index: 100;
+        }
+        .menu-btn {
+            background: #222;
+            border: 1px solid #444;
+            padding: 10px 40px;
+            margin: 10px;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+        .menu-btn:hover { background: #3b82f6; border-color: #fff; }
+
+        #interaction-prompt {
+            position: absolute;
+            top: 40%;
+            left: 50%;
+            transform: translateX(-50%);
+            background: rgba(0,0,0,0.7);
+            padding: 5px 10px;
+            border-radius: 4px;
+            font-size: 12px;
+            display: none;
+            pointer-events: none;
+        }
+    </style>
+</head>
+<body class="flex flex-col h-screen">
+
+    <!-- UI Overlays -->
+    <div id="menu-layer">
+        <h2 class="text-2xl font-bold mb-6 text-blue-400">GAME PAUSED</h2>
+        <button class="menu-btn" onclick="engine.toggleMenu()">Resume</button>
+        <button class="menu-btn" onclick="engine.saveGame()">Save Game</button>
+        <div class="text-[10px] text-zinc-500 mt-4">Save file will be exported as .SAVE.PanS</div>
+    </div>
+
+    <div id="interaction-prompt">Press 'E' to Talk</div>
+
+    <div id="cutscene-layer">
+        <div id="cutscene-speaker" class="text-blue-400 font-bold mb-1">Speaker</div>
+        <div id="cutscene-text">...</div>
+        <div class="text-[10px] text-zinc-500 mt-4 text-right">Press Space to continue</div>
+    </div>
+
+    <!-- Header / Nav (Debug Mode Only) -->
+    <div id="header-bar" class="p-4 border-b border-zinc-800 flex justify-between items-center bg-zinc-900 z-10">
+        <div>
+            <h1 class="text-blue-500 font-bold">PanS_ENGINE::RUNTIME</h1>
+            <p class="text-[10px] text-zinc-500">Active Level: ./Levels/<span id="lvl-path">...</span></p>
+        </div>
+        <div class="flex gap-6 items-center">
+            <div id="debug-ui" class="text-right">
+                <p class="text-[10px] uppercase text-zinc-500">Coordinate Finder</p>
+                <p id="mouse-coords" class="text-blue-400 font-bold text-xs">X: 000 | Y: 000</p>
+            </div>
+            <div id="status-light" class="w-3 h-3 rounded-full bg-red-500 animate-pulse"></div>
+        </div>
+    </div>
+
+    <!-- Main Workspace -->
+    <div id="viewport" class="flex-1 relative flex items-center justify-center bg-black overflow-hidden">
+        <canvas id="stage" width="800" height="450"></canvas>
+    </div>
+
+    <!-- Footer Console (Debug Mode Only) -->
+    <div id="console-bar" class="h-32 bg-black p-2 text-[11px] overflow-y-auto border-t border-zinc-800 text-green-500 z-10">
+        > PanS System Initializing...<br>
+    </div>
+
+<script>
+/**
+ * 1. PanS PARSER
+ */
+function parsePanS(text) {
+    if (!text) return null;
+    const lines = text.split('\n');
+    const data = {};
+    let hasData = false;
+    lines.forEach(line => {
+        const parts = line.split(':');
+        if (parts.length === 2) {
+            const k = parts[0].trim();
+            const v = parts[1].trim();
+            if (k) {
+                data[k] = isNaN(v) ? v : parseFloat(v);
+                hasData = true;
+            }
+        }
+    });
+    return hasData ? data : null;
+}
+
+/**
+ * 2. ENGINE CLASS
+ */
+class PanSEngine {
+    constructor(config = {}) {
+        this.canvas = document.getElementById('stage');
+        this.ctx = this.canvas.getContext('2d');
+        
+        // --- CONFIGURATION ---
+        this.currentLevelIndex = 0;
+        this.levelList = ["Level1", "Level2"]; 
+        this.debugMode = config.debugMode !== undefined ? config.debugMode : true; 
+        this.assetPath = config.assetPath || "./Assets/";
+        
+        this.player = null;
+        this.platforms = [];
+        this.enemies = [];
+        this.npcs = [];         // NPCs
+        this.checkpoints = [];  // Checkpoints
+        this.projectiles = []; 
+        this.powerups = [];    
+        this.goal = null;
+        this.assetCache = {};
+        
+        // State management
+        this.cutsceneActive = false;
+        this.cutsceneQueue = [];
+        this.menuActive = false;
+        this.spawnPos = { x: 50, y: 50 };
+
+        this.keys = {};
+        window.addEventListener('keydown', e => {
+            this.keys[e.code] = true;
+            if (e.code === 'KeyM') this.toggleMenu();
+            if (e.code === 'Space' && this.cutsceneActive) this.nextCutscene();
+            if (e.code === 'KeyE' && !this.cutsceneActive && !this.menuActive) this.checkNPCInteraction();
+        });
+        window.addEventListener('keyup', e => this.keys[e.code] = false);
+
+        this.applyUILayout();
+        this.boot();
+    }
+
+    applyUILayout() {
+        const header = document.getElementById('header-bar');
+        const consoleBar = document.getElementById('console-bar');
+        const viewport = document.getElementById('viewport');
+
+        if (!this.debugMode) {
+            header.classList.add('hidden');
+            consoleBar.classList.add('hidden');
+            viewport.classList.add('fullscreen-viewport');
+            this.canvas.style.border = "none";
+        } else {
+            this.canvas.classList.add('debug-active');
+            this.canvas.addEventListener('mousemove', e => {
+                const rect = this.canvas.getBoundingClientRect();
+                const x = Math.floor(e.clientX - rect.left);
+                const y = Math.floor(e.clientY - rect.top);
+                document.getElementById('mouse-coords').innerText = `X: ${x.toString().padStart(3, '0')} | Y: ${y.toString().padStart(3, '0')}`;
+            });
+        }
+    }
+
+    log(msg, color="#22c55e") {
+        console.log(`[PanS] ${msg}`);
+        if (!this.debugMode) return;
+        const con = document.getElementById('console-bar');
+        con.innerHTML += `> <span style="color: ${color}">${msg}</span><br>`;
+        con.scrollTop = con.scrollHeight;
+    }
+
+    async fetchFile(path, silent = false) {
+        try {
+            const response = await fetch(path);
+            if (!response.ok) throw new Error(`HTTP ${response.status}`);
+            return await response.text();
+        } catch (e) {
+            if (!path.toLowerCase().endsWith('.txt')) return await this.fetchFile(path + ".txt", true);
+            return null;
+        }
+    }
+
+    async loadAsset(filename) {
+        if (!filename || this.assetCache[filename]) return this.assetCache[filename];
+        return new Promise((resolve) => {
+            const img = new Image();
+            img.onload = () => { this.assetCache[filename] = img; resolve(img); };
+            img.onerror = () => resolve(null);
+            img.src = `${this.assetPath}${filename}`;
+        });
+    }
+
+    async boot() {
+        const charText = await this.fetchFile('./character.PanS');
+        if (!charText) return;
+        this.charData = parsePanS(charText);
+        await this.loadLevel(this.levelList[this.currentLevelIndex]);
+        this.loop();
+    }
+
+    async loadLevel(lvlName) {
+        this.log(`--- LOADING LEVEL: ${lvlName} ---`, "#a855f7");
+        document.getElementById('lvl-path').innerText = lvlName;
+        
+        this.platforms = []; this.enemies = []; this.powerups = []; this.projectiles = [];
+        this.npcs = []; this.checkpoints = [];
+
+        // Fetching lists of entities (Parallel)
+        const fetchTasks = [
+            this.fetchFile(`./Levels/${lvlName}/goal.PanS`),
+            ...Array.from({length: 10}, (_, i) => this.fetchFile(`./Levels/${lvlName}/Platforms/${i}.PanS`, true)),
+            ...Array.from({length: 5}, (_, i) => this.fetchFile(`./Levels/${lvlName}/Enemies/${i}.PanS`, true)),
+            ...Array.from({length: 5}, (_, i) => this.fetchFile(`./Levels/${lvlName}/Powerups/${i}.PanS`, true)),
+            ...Array.from({length: 5}, (_, i) => this.fetchFile(`./Levels/${lvlName}/NPCs/${i}.PanS`, true)),
+            ...Array.from({length: 3}, (_, i) => this.fetchFile(`./Levels/${lvlName}/Checkpoints/${i}.PanS`, true))
+        ];
+
+        const results = await Promise.all(fetchTasks);
+        const goalText = results[0];
+        const platforms = results.slice(1, 11);
+        const enemies = results.slice(11, 16);
+        const powerups = results.slice(16, 21);
+        const npcs = results.slice(21, 26);
+        const checkpoints = results.slice(26, 29);
+
+        if (goalText) this.goal = parsePanS(goalText);
+
+        platforms.forEach(t => { const d = parsePanS(t); if(d?.category === "platform") this.platforms.push(d); });
+        enemies.forEach(t => { const d = parsePanS(t); if(d?.category === "enemy") { d.originX = d.x; d.lastFired = 0; this.enemies.push(d); } });
+        powerups.forEach(t => { const d = parsePanS(t); if(d?.category === "powerup") this.powerups.push(d); });
+        npcs.forEach(t => { const d = parsePanS(t); if(d?.category === "npc") this.npcs.push(d); });
+        checkpoints.forEach(t => { const d = parsePanS(t); if(d?.category === "checkpoint") this.checkpoints.push(d); });
+
+        // Asset Loading
+        const allSprites = [this.goal, ...this.platforms, ...this.enemies, ...this.powerups, ...this.npcs, ...this.checkpoints]
+            .filter(e => e?.sprite).map(e => e.sprite);
+        if(this.charData.sprite) allSprites.push(this.charData.sprite);
+        await Promise.all([...new Set(allSprites)].map(s => this.loadAsset(s)));
+
+        this.spawnPos = { x: this.charData.x || 50, y: this.charData.y || 50 };
+        this.spawnPlayer();
+    }
+
+    spawnPlayer() {
+        this.player = {
+            gravity: 0.8, speed: 5, jump: -12, w: 30, h: 40,
+            ...this.charData, 
+            x: this.spawnPos.x, y: this.spawnPos.y, 
+            vx: 0, vy: 0, grounded: false,
+            invincible: 0
+        };
+    }
+
+    toggleMenu() {
+        this.menuActive = !this.menuActive;
+        document.getElementById('menu-layer').style.display = this.menuActive ? 'flex' : 'none';
+    }
+
+    // --- SAVE SYSTEM ---
+    saveGame() {
+        const numbers = ["zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine"];
+        const levelWord = numbers[this.currentLevelIndex + 1] || "one";
+        
+        let scrambled = "";
+        const randomString = () => Array.from({length: 5}, () => String.fromCharCode(97 + Math.floor(Math.random() * 26))).join('');
+
+        for (let i = 0; i < levelWord.length; i++) {
+            scrambled += levelWord[i];
+            if (i < levelWord.length - 1) scrambled += randomString();
+        }
+
+        const blob = new Blob([scrambled], { type: 'text/plain' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = ".SAVE.PanS";
+        a.click();
+        this.log(`Game Saved: Level ${this.currentLevelIndex + 1}`);
+        this.toggleMenu();
+    }
+
+    // --- NPC INTERACTION ---
+    checkNPCInteraction() {
+        const p = this.player;
+        this.npcs.forEach(npc => {
+            const dist = Math.hypot((p.x + p.w/2) - (npc.x + npc.w/2), (p.y + p.h/2) - (npc.y + npc.h/2));
+            if (dist < 60) {
+                // Parse dialogue (assume comma separated or JSON-like if advanced)
+                const dialogue = [{ speaker: npc.name || "NPC", text: npc.dialogue || "Hello traveler!" }];
+                this.triggerCutscene(dialogue);
+            }
+        });
+    }
+
+    triggerCutscene(dialogueArray) {
+        this.cutsceneActive = true;
+        this.cutsceneQueue = dialogueArray;
+        document.getElementById('cutscene-layer').style.display = 'block';
+        this.nextCutscene();
+    }
+
+    nextCutscene() {
+        if (this.cutsceneQueue.length === 0) {
+            this.cutsceneActive = false;
+            document.getElementById('cutscene-layer').style.display = 'none';
+            return;
+        }
+        const current = this.cutsceneQueue.shift();
+        document.getElementById('cutscene-speaker').innerText = current.speaker;
+        document.getElementById('cutscene-text').innerText = current.text;
+    }
+
+    update() {
+        if (!this.player || this.cutsceneActive || this.menuActive) return;
+        const p = this.player;
+
+        // Controls
+        if (this.keys['ArrowRight']) { p.vx = p.speed; p.facing = 1; }
+        else if (this.keys['ArrowLeft']) { p.vx = -p.speed; p.facing = -1; }
+        else p.vx *= 0.8;
+
+        if ((this.keys['Space'] || this.keys['ArrowUp']) && p.grounded) {
+            p.vy = p.jump; p.grounded = false;
+        }
+
+        p.vy += p.gravity;
+        p.x += p.vx; p.y += p.vy;
+        p.grounded = false;
+
+        // Collisions: Platforms
+        this.platforms.forEach(plat => {
+            if (p.x < plat.x + plat.w && p.x + p.w > plat.x && p.y < plat.y + plat.h && p.y + p.h > plat.y) {
+                if (p.vy >= 0 && (p.y + p.h - p.vy) <= plat.y) { p.y = plat.y - p.h; p.vy = 0; p.grounded = true; }
+                else if (plat.solidness === "solid_all") {
+                    if (p.vx > 0) p.x = plat.x - p.w;
+                    if (p.vx < 0) p.x = plat.x + p.w;
+                }
+            }
+        });
+
+        // NPCs: Interaction distance check
+        let nearNPC = false;
+        this.npcs.forEach(npc => {
+            const dist = Math.hypot((p.x + p.w/2) - (npc.x + npc.w/2), (p.y + p.h/2) - (npc.y + npc.h/2));
+            if (dist < 60) nearNPC = true;
+        });
+        document.getElementById('interaction-prompt').style.display = nearNPC ? 'block' : 'none';
+
+        // Checkpoints
+        this.checkpoints.forEach(cp => {
+            if (p.x < cp.x + cp.w && p.x + p.w > cp.x && p.y < cp.y + cp.h && p.y + p.h > cp.y) {
+                if (this.spawnPos.x !== cp.x || this.spawnPos.y !== cp.y) {
+                    this.spawnPos = { x: cp.x, y: cp.y };
+                    this.log("Checkpoint set!");
+                }
+            }
+        });
+
+        // Enemies
+        this.enemies.forEach(en => {
+            en.x += en.vx || 0;
+            if (Math.abs(en.x - en.originX) > (en.range || 0)) en.vx *= -1;
+            if (p.x < en.x + en.w && p.x + p.w > en.x && p.y < en.y + en.h && p.y + p.h > en.y) {
+                if (p.vy > 0 && (p.y + p.h - p.vy) <= en.y + 10) { en.dead = true; p.vy = p.jump * 0.6; }
+                else if (!p.invincible) this.spawnPlayer();
+            }
+        });
+        this.enemies = this.enemies.filter(e => !e.dead);
+
+        // Goal
+        if (this.goal && p.x < this.goal.x + this.goal.w && p.x + p.w > this.goal.x && p.y < this.goal.y + this.goal.h && p.y + p.h > this.goal.y) {
+            this.currentLevelIndex++;
+            this.loadLevel(this.levelList[this.currentLevelIndex]);
+        }
+
+        if (p.y > this.canvas.height + 200) this.spawnPlayer();
+    }
+
+    renderEntity(ent, color) {
+        if (ent.sprite && this.assetCache[ent.sprite]) {
+            this.ctx.drawImage(this.assetCache[ent.sprite], ent.x, ent.y, ent.w, ent.h);
+        } else {
+            this.ctx.fillStyle = color;
+            this.ctx.fillRect(ent.x, ent.y, ent.w, ent.h);
+        }
+    }
+
+    draw() {
+        this.ctx.clearRect(0, 0, this.canvas.width, this.canvas.height);
+        this.platforms.forEach(plat => this.renderEntity(plat, "#444"));
+        this.checkpoints.forEach(cp => this.renderEntity(cp, "#3b82f644"));
+        this.npcs.forEach(npc => this.renderEntity(npc, "#a855f7"));
+        this.enemies.forEach(en => this.renderEntity(en, "#ef4444"));
+        if(this.goal) this.renderEntity(this.goal, "#10b981");
+        if (this.player) this.renderEntity(this.player, "#3b82f6");
+    }
+
+    loop() {
+        this.update();
+        this.draw();
+        requestAnimationFrame(() => this.loop());
+    }
+}
+
+const engine = new PanSEngine({ debugMode: true });
+</script>
+</body>
+</html>
